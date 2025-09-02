@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.log
+seen.json
+subscribers.json
+stats.json
+.DS_Store
+*.swp
+*.swo
