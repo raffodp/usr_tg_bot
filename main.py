@@ -10,6 +10,7 @@ Funzionalità:
 - Polling Telegram frequente (ogni 5s) per comandi quasi in tempo reale.
 - Controllo notizie separato ogni 30 minuti (configurabile).
 - Dati persistenti tramite variabili d'ambiente e storage temporaneo.
+- Keep-alive server per Render.com (rimane sempre attivo).
 
 Uso:
 1) Python 3.10+
@@ -48,6 +49,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else None
 USER_AGENT = os.environ.get("USER_AGENT", "Mozilla/5.0 (compatible; MiMWatcher/1.0)")
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 20))
+KEEP_ALIVE_PORT = int(os.environ.get("PORT", 8000))  # Render usa PORT
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")  # Opzionale per persistenza avanzata
 # ==================================================
 
@@ -121,7 +123,7 @@ class InMemoryStorageManager:
                 json.dump(self._seen_news, f)
                 
         except Exception as e:
-            logging.warning("⚠️ Errore salvataggio file temporanei: %s", e)
+            logging.warning("Errore salvataggio file temporanei: %s", e)
     
     def add_subscriber(self, chat_id: int) -> bool:
         """Aggiunge un nuovo iscritto"""
@@ -186,6 +188,106 @@ class InMemoryStorageManager:
                 "last_news": self._seen_news[0] if self._seen_news else None
             }
 
+# =========================================================
+
+# =================== KEEP ALIVE SERVER ===================
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    """Handler per il server keep-alive che mantiene Render attivo"""
+    
+    def do_GET(self):
+        # Incrementa il contatore keep-alive
+        if hasattr(self.server, 'storage') and hasattr(self.server, 'stats'):
+            self.server.stats.keep_alive_hits += 1
+            self.server.storage.save_stats(self.server.stats)
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        
+        # Pagina web con info sul bot
+        uptime_seconds = int(time.time() - bot_start_time) if 'bot_start_time' in globals() else 0
+        uptime_formatted = format_duration(uptime_seconds)
+        
+        # Ottieni statistiche dallo storage
+        summary = self.server.storage.get_summary() if hasattr(self.server, 'storage') else {}
+        subscriber_count = summary.get('subscribers_count', 0)
+        seen_count = summary.get('seen_news_count', 0)
+        
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>MiM Watcher Bot - Status</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
+        .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        .status {{ color: #28a745; font-weight: bold; }}
+        .info {{ background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 20px 0; }}
+        .warning {{ background: #fff3cd; padding: 15px; border-radius: 5px; margin: 20px 0; color: #856404; }}
+        .emoji {{ font-size: 1.2em; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 MiM Watcher Bot</h1>
+        <p class="status">✅ Bot attivo su Render.com!</p>
+        
+        <div class="warning">
+            <h3>⚠️ Modalità Storage Temporaneo</h3>
+            <p>I dati sono archiviati in memoria e file temporanei. Per persistenza completa considera l'uso di un database.</p>
+        </div>
+        
+        <div class="info">
+            <h3>📊 Statistiche Live</h3>
+            <p><span class="emoji">⏰</span> <strong>Uptime:</strong> {uptime_formatted}</p>
+            <p><span class="emoji">👥</span> <strong>Iscritti:</strong> {subscriber_count}</p>
+            <p><span class="emoji">📰</span> <strong>Notizie viste:</strong> {seen_count}</p>
+            <p><span class="emoji">🔄</span> <strong>Controllo ogni:</strong> {NEWS_INTERVAL//60} minuti</p>
+            <p><span class="emoji">📱</span> <strong>Polling Telegram:</strong> ogni {TELEGRAM_POLL_INTERVAL} secondi</p>
+            <p><span class="emoji">🌐</span> <strong>Monitoraggio:</strong> <a href="{MIM_URL}" target="_blank">USR Lombardia</a></p>
+        </div>
+        
+        <div class="info">
+            <h3>🚀 Come usare il bot</h3>
+            <p>1. Cerca il bot su Telegram</p>
+            <p>2. Scrivi <code>/start</code> per iscriverti</p>
+            <p>3. Ricevi notifiche automatiche delle nuove notizie!</p>
+        </div>
+        
+        <div class="info">
+            <h3>💾 Archiviazione Dati</h3>
+            <p>📁 File temporanei del sistema</p>
+            <p>🔄 Backup automatico ogni operazione</p>
+            <p>⚠️ Dati potrebbero essere persi al restart (usa database per persistenza completa)</p>
+        </div>
+        
+        <p><small>🚀 Hosting leggero su Render.com senza database</small></p>
+    </div>
+</body>
+</html>
+        """
+        self.wfile.write(html.encode())
+    
+    def log_message(self, format, *args):
+        # Disabilita i log del server HTTP
+        pass
+
+def start_keep_alive_server(storage_manager, stats):
+    """Avvia il server keep-alive in un thread separato"""
+    try:
+        server = HTTPServer(('0.0.0.0', KEEP_ALIVE_PORT), KeepAliveHandler)
+        server.storage = storage_manager
+        server.stats = stats
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logging.info("🌐 Keep-alive server avviato su porta %s", KEEP_ALIVE_PORT)
+        return server
+    except Exception as e:
+        logging.error("❌ Errore avvio keep-alive server: %s", e)
+        return None
+
 # ============================================================
 
 @dataclass
@@ -205,6 +307,7 @@ class BotStats:
     total_commands_processed: int = 0
     last_news_time: Optional[float] = None
     last_error_time: Optional[float] = None
+    keep_alive_hits: int = 0
 
 def setup_logging() -> None:
     logging.basicConfig(
@@ -593,6 +696,7 @@ def handle_stats_command(chat_id: int, storage: InMemoryStorageManager, stats: B
            f"🕐 <b>Ultima news:</b> {last_news_text}\n" \
            f"📄 <b>Notizie memorizzate:</b> {seen_count}\n" \
            f"🔄 <b>Intervallo controlli:</b> {NEWS_INTERVAL//60} minuti\n" \
+           f"🌐 <b>Keep-alive hits:</b> {stats.keep_alive_hits}\n\n" \
            f"💾 <b>Storage:</b> Memoria + file temporanei\n" \
            f"⚠️ <b>Nota:</b> Dati temporanei (restart = reset)\n\n" \
            f"💡 Il bot sta monitorando USR Lombardia del MiM!\n" \
@@ -689,12 +793,16 @@ def main() -> None:
     stats = BotStats(start_time=bot_start_time)
     storage.save_stats(stats)
 
+    # Avvia il keep-alive server per Render
+    keep_alive_server = start_keep_alive_server(storage, stats)
+
     offset = None
 
     logging.info("🚀 MiM Watcher avviato su Render.com (modalità leggera)!")
     logging.info("⏰ Controllo notizie ogni %s secondi", NEWS_INTERVAL)
     logging.info("📱 Polling Telegram ogni %s secondi", TELEGRAM_POLL_INTERVAL)
     logging.info("👥 Utenti iscritti: %s", len(storage.get_subscribers()))
+    logging.info("🌐 Keep-alive server su porta %s", KEEP_ALIVE_PORT)
     logging.info("💾 Storage: Memoria temporanea + file temporanei")
     logging.info("⚠️ Dati potrebbero essere persi al restart del servizio")
     
@@ -728,6 +836,9 @@ def main() -> None:
         except KeyboardInterrupt:
             logging.info("⏹️ Interrotto dall'utente. Salvataggio finale...")
             storage._save_to_temp_files()
+            if keep_alive_server:
+                keep_alive_server.shutdown()
+            break
         except Exception as e:
             logging.exception("❌ Errore inatteso nel loop: %s", e)
             stats.last_error_time = time.time()
