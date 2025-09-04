@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-Telegram bot/daemon che controlla la pagina USR Lombardia del MiM ogni 30 minuti
-(e invia una notifica quando compare una nuova notizia nel tab-container).
+Telegram bot che controlla la pagina USR Lombardia del MiM ogni 30 minuti
+e invia notifiche quando compare una nuova notizia.
 
-Versione ottimizzata per Render.com SENZA database - usa variabili d'ambiente e storage temporaneo.
+Versione semplificata per Render.com - usa solo variabili d'ambiente.
 
 Funzionalità:
-- Gestione iscrizioni multiple (/start, /stop, /help).
-- Polling Telegram frequente (ogni 5s) per comandi quasi in tempo reale.
-- Controllo notizie separato ogni 30 minuti (configurabile).
-- Dati persistenti tramite variabili d'ambiente e storage temporaneo.
-- Keep-alive server per Render.com (rimane sempre attivo).
+- Gestione iscrizioni multiple (/start, /stop, /help)
+- Polling Telegram ogni 5 secondi
+- Controllo notizie ogni 30 minuti
+- Storage solo in memoria con variabili d'ambiente
 
 Uso:
 1) Python 3.10+
 2) pip install -U requests beautifulsoup4 python-dotenv
-3) Variabili ambiente: TELEGRAM_BOT_TOKEN, RENDER_API_KEY (opzionale)
-4) Avvia: python telegram_mim_watcher.py
+3) Variabile ambiente: TELEGRAM_BOT_TOKEN
+4) Avvia: python main.py
 """
 from __future__ import annotations
 
@@ -24,13 +23,12 @@ import os
 import time
 import json
 import logging
-import tempfile
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List
 from urllib.parse import urljoin
-from datetime import datetime, timedelta
-from threading import Thread, Lock
+from datetime import datetime
+from threading import Lock
 
 import requests
 from bs4 import BeautifulSoup
@@ -44,93 +42,87 @@ except Exception:
 # ===================== Config =====================
 MIM_URL = "https://www.mim.gov.it/web/usr-lombardia"
 NEWS_INTERVAL = int(os.environ.get("NEWS_INTERVAL", 1800))  # default 30 min
-TELEGRAM_POLL_INTERVAL = int(os.environ.get("TELEGRAM_POLL_INTERVAL", 5))  # default 5 sec
+TELEGRAM_POLL_INTERVAL = 5  # 5 secondi fisso
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else None
-USER_AGENT = os.environ.get("USER_AGENT", "Mozilla/5.0 (compatible; MiMWatcher/1.0)")
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 20))
-KEEP_ALIVE_PORT = int(os.environ.get("PORT", 8000))  # Render usa PORT
-RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")  # Opzionale per persistenza avanzata
+USER_AGENT = "Mozilla/5.0 (compatible; MiMWatcher/1.0)"
+REQUEST_TIMEOUT = 20  # 20 secondi fisso
 # ==================================================
 
 # =================== STORAGE MANAGER ===================
-class InMemoryStorageManager:
-    """Gestisce i dati in memoria con backup su variabili d'ambiente"""
+class SimpleStorageManager:
+    """Gestisce i dati utilizzando solo file JSON"""
     
     def __init__(self):
         self._subscribers = set()
         self._seen_news = []
         self._stats = None
         self._lock = Lock()
-        self.temp_dir = Path(tempfile.gettempdir()) / "mimwatcher"
-        self.temp_dir.mkdir(exist_ok=True)
-        self._load_from_env_and_temp()
+        self._load_data()
     
-    def _load_from_env_and_temp(self):
-        """Carica i dati dalle variabili d'ambiente e file temporanei"""
+    def _load_data(self):
+        """Carica i dati dai file JSON"""
         try:
-            # Carica subscribers dalle variabili d'ambiente
-            subscribers_env = os.environ.get("MIMI_SUBSCRIBERS", "")
-            if subscribers_env:
-                self._subscribers = set(map(int, subscribers_env.split(",")))
-                logging.info("📥 Caricati %d subscribers dalle env vars", len(self._subscribers))
-            
-            # Carica seen news dalle variabili d'ambiente (solo le più recenti)
-            seen_env = os.environ.get("MIMI_SEEN_NEWS", "")
-            if seen_env:
-                self._seen_news = seen_env.split(",")[:50]  # Max 50 elementi
-                logging.info("📥 Caricate %d notizie viste dalle env vars", len(self._seen_news))
-            
-            # Prova a caricare dai file temporanei come backup
-            self._load_from_temp_files()
-            
+            self._load_from_files()
         except Exception as e:
-            logging.warning("⚠️ Errore caricamento dati dalle env vars: %s", e)
+            logging.warning("⚠️ Errore caricamento dati: %s", e)
     
-    def _load_from_temp_files(self):
-        """Carica i dati dai file temporanei del sistema"""
+    def _load_from_files(self):
+        """Carica i dati dai file JSON"""
         try:
-            # File subscribers
-            subs_file = self.temp_dir / "subscribers.json"
-            if subs_file.exists():
-                with open(subs_file, 'r') as f:
-                    temp_subs = set(json.load(f))
-                    if len(temp_subs) > len(self._subscribers):
-                        self._subscribers.update(temp_subs)
-                        logging.info("📥 Aggiornati subscribers da file temp: %d totali", len(self._subscribers))
+            # Carica subscribers
+            if Path('subscribers.json').exists():
+                with open('subscribers.json', 'r') as f:
+                    self._subscribers = set(json.load(f))
+                    logging.info("📥 Caricati %d subscribers da JSON", len(self._subscribers))
             
-            # File seen news
-            seen_file = self.temp_dir / "seen.json"
-            if seen_file.exists():
-                with open(seen_file, 'r') as f:
-                    temp_seen = json.load(f)
-                    if len(temp_seen) > len(self._seen_news):
-                        self._seen_news = temp_seen[:50]
-                        logging.info("📥 Aggiornate notizie viste da file temp: %d totali", len(self._seen_news))
-        
+            # Carica seen news
+            if Path('seen.json').exists():
+                with open('seen.json', 'r') as f:
+                    self._seen_news = json.load(f)[:50]
+                    logging.info("📥 Caricate %d notizie viste da JSON", len(self._seen_news))
+                    
+            # Carica stats
+            if Path('stats.json').exists():
+                with open('stats.json', 'r') as f:
+                    stats_data = json.load(f)
+                    self._stats = BotStats(**stats_data)
+                    
         except Exception as e:
-            logging.warning("⚠️ Errore caricamento file temporanei: %s", e)
+            logging.warning("⚠️ Errore caricamento file JSON: %s", e)
     
-    def _save_to_temp_files(self):
-        """Salva i dati nei file temporanei come backup"""
+    
+    def _save_to_files(self):
+        """Salva i dati nei file JSON"""
         try:
             # Salva subscribers
-            with open(self.temp_dir / "subscribers.json", 'w') as f:
+            with open('subscribers.json', 'w') as f:
                 json.dump(list(self._subscribers), f)
             
             # Salva seen news
-            with open(self.temp_dir / "seen.json", 'w') as f:
+            with open('seen.json', 'w') as f:
                 json.dump(self._seen_news, f)
-                
+            
+            # Salva stats se esistono
+            if self._stats:
+                with open('stats.json', 'w') as f:
+                    json.dump({
+                        'start_time': self._stats.start_time,
+                        'total_news_sent': self._stats.total_news_sent,
+                        'total_commands_processed': self._stats.total_commands_processed,
+                        'last_news_time': self._stats.last_news_time,
+                        'last_error_time': self._stats.last_error_time
+                    }, f)
+                    
         except Exception as e:
-            logging.warning("Errore salvataggio file temporanei: %s", e)
+            logging.warning("⚠️ Errore salvataggio file JSON: %s", e)
     
     def add_subscriber(self, chat_id: int) -> bool:
         """Aggiunge un nuovo iscritto"""
         with self._lock:
             if chat_id not in self._subscribers:
                 self._subscribers.add(chat_id)
-                self._save_to_temp_files()
+                self._save_to_files()
                 logging.info("✅ Nuovo iscritto aggiunto: %s", chat_id)
                 return True
             return False
@@ -140,7 +132,7 @@ class InMemoryStorageManager:
         with self._lock:
             if chat_id in self._subscribers:
                 self._subscribers.remove(chat_id)
-                self._save_to_temp_files()
+                self._save_to_files()
                 logging.info("✅ Iscritto rimosso: %s", chat_id)
                 return True
             return False
@@ -160,8 +152,8 @@ class InMemoryStorageManager:
         with self._lock:
             if news_key not in self._seen_news:
                 self._seen_news.insert(0, news_key)
-                self._seen_news = self._seen_news[:50]  # Mantieni solo le più recenti
-                self._save_to_temp_files()
+                self._seen_news = self._seen_news[:50]
+                self._save_to_files()
                 return True
             return False
     
@@ -190,105 +182,6 @@ class InMemoryStorageManager:
 
 # =========================================================
 
-# =================== KEEP ALIVE SERVER ===================
-class KeepAliveHandler(BaseHTTPRequestHandler):
-    """Handler per il server keep-alive che mantiene Render attivo"""
-    
-    def do_GET(self):
-        # Incrementa il contatore keep-alive
-        if hasattr(self.server, 'storage') and hasattr(self.server, 'stats'):
-            self.server.stats.keep_alive_hits += 1
-            self.server.storage.save_stats(self.server.stats)
-        
-        self.send_response(200)
-        self.send_header('Content-type', 'text/html')
-        self.end_headers()
-        
-        # Pagina web con info sul bot
-        uptime_seconds = int(time.time() - bot_start_time) if 'bot_start_time' in globals() else 0
-        uptime_formatted = format_duration(uptime_seconds)
-        
-        # Ottieni statistiche dallo storage
-        summary = self.server.storage.get_summary() if hasattr(self.server, 'storage') else {}
-        subscriber_count = summary.get('subscribers_count', 0)
-        seen_count = summary.get('seen_news_count', 0)
-        
-        html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>MiM Watcher Bot - Status</title>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }}
-        .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        .status {{ color: #28a745; font-weight: bold; }}
-        .info {{ background: #e7f3ff; padding: 15px; border-radius: 5px; margin: 20px 0; }}
-        .warning {{ background: #fff3cd; padding: 15px; border-radius: 5px; margin: 20px 0; color: #856404; }}
-        .emoji {{ font-size: 1.2em; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>🤖 MiM Watcher Bot</h1>
-        <p class="status">✅ Bot attivo su Render.com!</p>
-        
-        <div class="warning">
-            <h3>⚠️ Modalità Storage Temporaneo</h3>
-            <p>I dati sono archiviati in memoria e file temporanei. Per persistenza completa considera l'uso di un database.</p>
-        </div>
-        
-        <div class="info">
-            <h3>📊 Statistiche Live</h3>
-            <p><span class="emoji">⏰</span> <strong>Uptime:</strong> {uptime_formatted}</p>
-            <p><span class="emoji">👥</span> <strong>Iscritti:</strong> {subscriber_count}</p>
-            <p><span class="emoji">📰</span> <strong>Notizie viste:</strong> {seen_count}</p>
-            <p><span class="emoji">🔄</span> <strong>Controllo ogni:</strong> {NEWS_INTERVAL//60} minuti</p>
-            <p><span class="emoji">📱</span> <strong>Polling Telegram:</strong> ogni {TELEGRAM_POLL_INTERVAL} secondi</p>
-            <p><span class="emoji">🌐</span> <strong>Monitoraggio:</strong> <a href="{MIM_URL}" target="_blank">USR Lombardia</a></p>
-        </div>
-        
-        <div class="info">
-            <h3>🚀 Come usare il bot</h3>
-            <p>1. Cerca il bot su Telegram</p>
-            <p>2. Scrivi <code>/start</code> per iscriverti</p>
-            <p>3. Ricevi notifiche automatiche delle nuove notizie!</p>
-        </div>
-        
-        <div class="info">
-            <h3>💾 Archiviazione Dati</h3>
-            <p>📁 File temporanei del sistema</p>
-            <p>🔄 Backup automatico ogni operazione</p>
-            <p>⚠️ Dati potrebbero essere persi al restart (usa database per persistenza completa)</p>
-        </div>
-        
-        <p><small>🚀 Hosting leggero su Render.com senza database</small></p>
-    </div>
-</body>
-</html>
-        """
-        self.wfile.write(html.encode())
-    
-    def log_message(self, format, *args):
-        # Disabilita i log del server HTTP
-        pass
-
-def start_keep_alive_server(storage_manager, stats):
-    """Avvia il server keep-alive in un thread separato"""
-    try:
-        server = HTTPServer(('0.0.0.0', KEEP_ALIVE_PORT), KeepAliveHandler)
-        server.storage = storage_manager
-        server.stats = stats
-        thread = Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        logging.info("🌐 Keep-alive server avviato su porta %s", KEEP_ALIVE_PORT)
-        return server
-    except Exception as e:
-        logging.error("❌ Errore avvio keep-alive server: %s", e)
-        return None
-
-# ============================================================
 
 @dataclass
 class NewsItem:
@@ -307,7 +200,6 @@ class BotStats:
     total_commands_processed: int = 0
     last_news_time: Optional[float] = None
     last_error_time: Optional[float] = None
-    keep_alive_hits: int = 0
 
 def setup_logging() -> None:
     logging.basicConfig(
@@ -481,7 +373,7 @@ def send_news_notification(item: NewsItem, chat_id: int) -> bool:
     
     return send_telegram_message(chat_id, text, disable_preview=False)
 
-def broadcast(item: NewsItem, storage: InMemoryStorageManager, stats: BotStats) -> None:
+def broadcast(item: NewsItem, storage: SimpleStorageManager, stats: BotStats) -> None:
     """Invia la notifica a tutti gli iscritti"""
     subscribers = storage.get_subscribers()
     successful_sends = 0
@@ -497,7 +389,7 @@ def broadcast(item: NewsItem, storage: InMemoryStorageManager, stats: BotStats) 
     stats.last_news_time = time.time()
     storage.save_stats(stats)
 
-def check_once(storage: InMemoryStorageManager, stats: BotStats) -> None:
+def check_once(storage: SimpleStorageManager, stats: BotStats) -> None:
     """Controlla una volta le notizie"""
     try:
         html = fetch_page(MIM_URL)
@@ -526,7 +418,7 @@ def check_once(storage: InMemoryStorageManager, stats: BotStats) -> None:
 
 # =================== COMMAND HANDLERS ===================
 
-def handle_start_command(chat_id: int, storage: InMemoryStorageManager, send_welcome_news: bool = True) -> bool:
+def handle_start_command(chat_id: int, storage: SimpleStorageManager, send_welcome_news: bool = True) -> bool:
     """Gestisce il comando /start"""
     if storage.add_subscriber(chat_id):
         logging.info("Nuovo iscritto: %s", chat_id)
@@ -542,7 +434,7 @@ def handle_start_command(chat_id: int, storage: InMemoryStorageManager, send_wel
                       f"• /stats - Statistiche del bot\n" \
                       f"• /stop - Cancella iscrizione\n\n" \
                       f"🔄 Controllo notizie ogni {NEWS_INTERVAL//60} minuti\n" \
-                      f"💾 Dati archiviati in memoria (temporaneo)"
+                      f"💾 Dati salvati in JSON (persistenti)"
         
         send_telegram_message(chat_id, welcome_text)
         
@@ -577,7 +469,7 @@ def handle_start_command(chat_id: int, storage: InMemoryStorageManager, send_wel
         send_telegram_message(chat_id, already_text)
         return False
 
-def handle_stop_command(chat_id: int, storage: InMemoryStorageManager) -> bool:
+def handle_stop_command(chat_id: int, storage: SimpleStorageManager) -> bool:
     """Gestisce il comando /stop"""
     if storage.remove_subscriber(chat_id):
         logging.info("Utente %s disiscritto.", chat_id)
@@ -596,7 +488,7 @@ def handle_stop_command(chat_id: int, storage: InMemoryStorageManager) -> bool:
         send_telegram_message(chat_id, not_subscribed_text)
         return False
 
-def handle_help_command(chat_id: int, storage: InMemoryStorageManager):
+def handle_help_command(chat_id: int, storage: SimpleStorageManager):
     """Gestisce il comando /help"""
     subscriber_count = len(storage.get_subscribers())
     help_text = f"📖 <b>Comandi disponibili:</b>\n\n" \
@@ -654,7 +546,7 @@ def handle_next_command(chat_id: int, last_news_check: float):
     
     send_telegram_message(chat_id, text)
 
-def handle_force_command(chat_id: int, storage: InMemoryStorageManager, stats: BotStats):
+def handle_force_command(chat_id: int, storage: SimpleStorageManager, stats: BotStats):
     """Gestisce il comando /force"""
     send_telegram_message(chat_id, "🚀 Controllo forzato in corso...")
     
@@ -670,7 +562,7 @@ def handle_force_command(chat_id: int, storage: InMemoryStorageManager, stats: B
         logging.error("Errore /force: %s", e)
         send_telegram_message(chat_id, "⚠️ Errore durante il controllo forzato. Riprova più tardi.")
 
-def handle_stats_command(chat_id: int, storage: InMemoryStorageManager, stats: BotStats):
+def handle_stats_command(chat_id: int, storage: SimpleStorageManager, stats: BotStats):
     """Gestisce il comando /stats con informazioni dal storage temporaneo"""
     current_time = time.time()
     uptime_seconds = int(current_time - stats.start_time)
@@ -696,15 +588,14 @@ def handle_stats_command(chat_id: int, storage: InMemoryStorageManager, stats: B
            f"🕐 <b>Ultima news:</b> {last_news_text}\n" \
            f"📄 <b>Notizie memorizzate:</b> {seen_count}\n" \
            f"🔄 <b>Intervallo controlli:</b> {NEWS_INTERVAL//60} minuti\n" \
-           f"🌐 <b>Keep-alive hits:</b> {stats.keep_alive_hits}\n\n" \
-           f"💾 <b>Storage:</b> Memoria + file temporanei\n" \
-           f"⚠️ <b>Nota:</b> Dati temporanei (restart = reset)\n\n" \
+           f"💾 <b>Storage:</b> Solo file JSON\n" \
+           f"✅ <b>Nota:</b> Dati persistenti tra restart\n\n" \
            f"💡 Il bot sta monitorando USR Lombardia del MiM!\n" \
-           f"🚀 Hosting: Render.com (leggero, senza database)"
+           f"🚀 Hosting: Render.com con persistenza JSON"
     
     send_telegram_message(chat_id, text)
 
-def poll_updates(offset: Optional[int], storage: InMemoryStorageManager, stats: BotStats, last_news_check: float) -> Optional[int]:
+def poll_updates(offset: Optional[int], storage: SimpleStorageManager, stats: BotStats, last_news_check: float) -> Optional[int]:
     """Polling aggiornato per usare lo storage temporaneo"""
     if not TELEGRAM_API:
         return offset
@@ -762,15 +653,6 @@ def poll_updates(offset: Optional[int], storage: InMemoryStorageManager, stats: 
         logging.error("Errore poll_updates: %s", e)
         return offset
 
-def cleanup_and_backup_periodically(storage: InMemoryStorageManager):
-    """Esegue pulizia e backup periodici (opzionale)"""
-    try:
-        # Questa funzione può essere chiamata periodicamente per fare backup
-        # Per ora salva solo nei file temporanei
-        storage._save_to_temp_files()
-        logging.info("🧹 Backup periodico completato")
-    except Exception as e:
-        logging.warning("⚠️ Errore backup periodico: %s", e)
 
 def main() -> None:
     global bot_start_time
@@ -780,10 +662,10 @@ def main() -> None:
         logging.error("❌ Config mancante. Imposta TELEGRAM_BOT_TOKEN nelle variabili ambiente")
         return
 
-    # Inizializza lo storage manager in memoria
+    # Inizializza lo storage manager semplificato
     try:
-        storage = InMemoryStorageManager()
-        logging.info("✅ Storage manager in memoria inizializzato")
+        storage = SimpleStorageManager()
+        logging.info("✅ Storage manager semplificato inizializzato")
     except Exception as e:
         logging.error("❌ Impossibile inizializzare lo storage: %s", e)
         return
@@ -793,26 +675,17 @@ def main() -> None:
     stats = BotStats(start_time=bot_start_time)
     storage.save_stats(stats)
 
-    # Avvia il keep-alive server per Render
-    keep_alive_server = start_keep_alive_server(storage, stats)
 
     offset = None
 
-    logging.info("🚀 MiM Watcher avviato su Render.com (modalità leggera)!")
+    logging.info("🚀 MiM Watcher avviato su Render.com!")
     logging.info("⏰ Controllo notizie ogni %s secondi", NEWS_INTERVAL)
     logging.info("📱 Polling Telegram ogni %s secondi", TELEGRAM_POLL_INTERVAL)
     logging.info("👥 Utenti iscritti: %s", len(storage.get_subscribers()))
-    logging.info("🌐 Keep-alive server su porta %s", KEEP_ALIVE_PORT)
-    logging.info("💾 Storage: Memoria temporanea + file temporanei")
-    logging.info("⚠️ Dati potrebbero essere persi al restart del servizio")
-    
-    if RENDER_API_KEY:
-        logging.info("🔑 RENDER_API_KEY configurata (backup avanzato disponibile)")
-    else:
-        logging.info("💡 Considera l'aggiunta di RENDER_API_KEY per funzionalità avanzate")
+    logging.info("💾 Storage: Solo file JSON")
+    logging.info("✅ Dati persistenti tra restart")
 
     last_news_check = 0
-    last_backup = time.time()
     
     while True:
         try:
@@ -826,18 +699,11 @@ def main() -> None:
                 check_once(storage, stats)
                 last_news_check = now
 
-            # Backup periodico ogni 10 minuti
-            if now - last_backup >= 600:  # 10 minuti
-                cleanup_and_backup_periodically(storage)
-                last_backup = now
 
             time.sleep(TELEGRAM_POLL_INTERVAL)
             
         except KeyboardInterrupt:
-            logging.info("⏹️ Interrotto dall'utente. Salvataggio finale...")
-            storage._save_to_temp_files()
-            if keep_alive_server:
-                keep_alive_server.shutdown()
+            logging.info("⏹️ Interrotto dall'utente.")
             break
         except Exception as e:
             logging.exception("❌ Errore inatteso nel loop: %s", e)
