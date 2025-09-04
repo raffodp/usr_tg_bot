@@ -28,7 +28,8 @@ from dataclasses import dataclass
 from typing import Optional, List
 from urllib.parse import urljoin
 from datetime import datetime
-from threading import Lock
+from threading import Lock, Thread
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import requests
 from bs4 import BeautifulSoup
@@ -47,6 +48,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else None
 USER_AGENT = "Mozilla/5.0 (compatible; MiMWatcher/1.0)"
 REQUEST_TIMEOUT = 20  # 20 secondi fisso
+HTTP_PORT = int(os.environ.get("PORT", 8000))  # Porta per Render
 # ==================================================
 
 # =================== STORAGE MANAGER ===================
@@ -201,11 +203,41 @@ class BotStats:
     last_news_time: Optional[float] = None
     last_error_time: Optional[float] = None
 
+class HealthHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler for Render health checks"""
+    def do_GET(self):
+        if self.path == '/' or self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            response = {
+                'status': 'ok',
+                'service': 'telegram-bot',
+                'timestamp': datetime.now().isoformat()
+            }
+            self.wfile.write(json.dumps(response).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Disable HTTP server logs to reduce noise
+        pass
+
 def setup_logging() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
+
+def start_http_server():
+    """Avvia il server HTTP per soddisfare i requisiti di Render"""
+    try:
+        server = HTTPServer(('0.0.0.0', HTTP_PORT), HealthHandler)
+        logging.info("🌐 Server HTTP avviato sulla porta %d per Render", HTTP_PORT)
+        server.serve_forever()
+    except Exception as e:
+        logging.error("❌ Errore server HTTP: %s", e)
 
 def format_time_remaining(seconds: int) -> str:
     """Formatta i secondi rimanenti in un formato leggibile"""
@@ -676,9 +708,14 @@ def main() -> None:
     storage.save_stats(stats)
 
 
+    # Avvia il server HTTP in un thread separato per Render
+    http_thread = Thread(target=start_http_server, daemon=True)
+    http_thread.start()
+
     offset = None
 
     logging.info("🚀 MiM Watcher avviato su Render.com!")
+    logging.info("🌐 Server HTTP sulla porta %d", HTTP_PORT)
     logging.info("⏰ Controllo notizie ogni %s secondi", NEWS_INTERVAL)
     logging.info("📱 Polling Telegram ogni %s secondi", TELEGRAM_POLL_INTERVAL)
     logging.info("👥 Utenti iscritti: %s", len(storage.get_subscribers()))
